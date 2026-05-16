@@ -30,6 +30,7 @@ const XTERM_CSS_GZ: &[u8] = include_bytes!("../assets/xterm.css.gz");
 const XTERM_JS_GZ: &[u8] = include_bytes!("../assets/xterm.js.gz");
 const XTERM_FIT_JS_GZ: &[u8] = include_bytes!("../assets/xterm-addon-fit.js.gz");
 const XTERM_LINKS_JS_GZ: &[u8] = include_bytes!("../assets/xterm-addon-web-links.js.gz");
+const XTERM_WEBGL_JS_GZ: &[u8] = include_bytes!("../assets/xterm-addon-webgl.js.gz");
 
 const INDEX_HTML: &str = r#"<!doctype html>
 <html>
@@ -47,6 +48,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <script src="/assets/xterm.js"></script>
 <script src="/assets/xterm-addon-fit.js"></script>
 <script src="/assets/xterm-addon-web-links.js"></script>
+<script src="/assets/xterm-addon-webgl.js"></script>
 <script>
   const term = new Terminal({
     cursorBlink: true,
@@ -60,6 +62,16 @@ const INDEX_HTML: &str = r#"<!doctype html>
   term.loadAddon(new WebLinksAddon.WebLinksAddon());
   term.open(document.getElementById('term'));
   fit.fit();
+
+  // GPU renderer. Falls back to DOM if WebGL2 is unavailable or the
+  // context is lost (e.g. tab backgrounded on some GPUs, driver reset).
+  try {
+    const webgl = new WebglAddon.WebglAddon();
+    webgl.onContextLoss(() => webgl.dispose());
+    term.loadAddon(webgl);
+  } catch (e) {
+    console.warn('WebGL renderer unavailable, using DOM renderer:', e);
+  }
 
   // Stable per-browser session id so page reload reattaches to the same shell.
   let sid = localStorage.getItem('xterm-session');
@@ -425,6 +437,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/assets/xterm-addon-web-links.js",
             get(|| async { gz("application/javascript; charset=utf-8", XTERM_LINKS_JS_GZ) }),
+        )
+        .route(
+            "/assets/xterm-addon-webgl.js",
+            get(|| async { gz("application/javascript; charset=utf-8", XTERM_WEBGL_JS_GZ) }),
         )
         .route("/ws", get(ws_handler))
         .with_state(state);
