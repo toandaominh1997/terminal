@@ -26,10 +26,10 @@ const READ_BUF: usize = 64 * 1024;
 const BROADCAST_CAP: usize = 256;
 const HISTORY_CAP_BYTES: usize = 1024 * 1024;
 
-const XTERM_CSS: &str = include_str!("../assets/xterm.css");
-const XTERM_JS: &str = include_str!("../assets/xterm.js");
-const XTERM_FIT_JS: &str = include_str!("../assets/xterm-addon-fit.js");
-const XTERM_LINKS_JS: &str = include_str!("../assets/xterm-addon-web-links.js");
+const XTERM_CSS_GZ: &[u8] = include_bytes!("../assets/xterm.css.gz");
+const XTERM_JS_GZ: &[u8] = include_bytes!("../assets/xterm.js.gz");
+const XTERM_FIT_JS_GZ: &[u8] = include_bytes!("../assets/xterm-addon-fit.js.gz");
+const XTERM_LINKS_JS_GZ: &[u8] = include_bytes!("../assets/xterm-addon-web-links.js.gz");
 
 const INDEX_HTML: &str = r#"<!doctype html>
 <html>
@@ -103,14 +103,14 @@ enum ClientCtrl {
 
 #[derive(Default)]
 struct History {
-    chunks: VecDeque<Vec<u8>>,
+    chunks: VecDeque<Arc<[u8]>>,
     bytes: usize,
 }
 
 impl History {
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: Arc<[u8]>) {
         self.bytes += chunk.len();
-        self.chunks.push_back(chunk.to_vec());
+        self.chunks.push_back(chunk);
         while self.bytes > HISTORY_CAP_BYTES {
             match self.chunks.pop_front() {
                 Some(c) => self.bytes -= c.len(),
@@ -132,7 +132,7 @@ struct Session {
     pty_master: Mutex<Box<dyn MasterPty + Send>>,
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     history: Mutex<History>,
-    output: broadcast::Sender<Vec<u8>>,
+    output: broadcast::Sender<Arc<[u8]>>,
     done: Arc<Notify>,
 }
 
@@ -171,7 +171,7 @@ fn spawn_session(sessions: SessionMap, id: String) -> anyhow::Result<Arc<Session
     let mut reader = master.try_clone_reader()?;
     let mut writer = master.take_writer()?;
 
-    let (output_tx, _) = broadcast::channel::<Vec<u8>>(BROADCAST_CAP);
+    let (output_tx, _) = broadcast::channel::<Arc<[u8]>>(BROADCAST_CAP);
     let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
     let session = Arc::new(Session {
@@ -193,8 +193,10 @@ fn spawn_session(sessions: SessionMap, id: String) -> anyhow::Result<Arc<Session
             }
         })?;
 
-    // PTY reader thread. Append-then-broadcast under the history lock so any new
-    // subscriber sees each chunk in either the snapshot OR the broadcast, never both.
+    // PTY reader thread. Push into history under the lock, then drop the lock
+    // *before* broadcasting so a slow attaching client copying the snapshot
+    // cannot stall the next chunk's broadcast. The subscribe+snapshot pair
+    // below still holds the lock to keep attach atomic.
     let sess_reader = session.clone();
     let id_for_reader = id.clone();
     std::thread::Builder::new()
@@ -205,10 +207,12 @@ fn spawn_session(sessions: SessionMap, id: String) -> anyhow::Result<Arc<Session
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let chunk = &buf[..n];
-                        let mut h = sess_reader.history.lock().unwrap();
-                        h.push(chunk);
-                        let _ = sess_reader.output.send(chunk.to_vec());
+                        let chunk: Arc<[u8]> = Arc::from(&buf[..n]);
+                        {
+                            let mut h = sess_reader.history.lock().unwrap();
+                            h.push(chunk.clone());
+                        }
+                        let _ = sess_reader.output.send(chunk);
                     }
                 }
             }
@@ -265,7 +269,9 @@ async fn handle_socket(socket: WebSocket, session_id: Option<String>, state: App
 async fn run_attach(socket: WebSocket, session: Arc<Session>) -> anyhow::Result<()> {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Atomic subscribe + snapshot: same lock the reader holds across push+broadcast.
+    // Atomic subscribe + snapshot: same lock the reader takes to append to
+    // history, so any new subscriber sees each chunk in either the snapshot
+    // OR the broadcast (never both, never neither).
     let (snapshot, mut rx) = {
         let h = session.history.lock().unwrap();
         let rx = session.output.subscribe();
@@ -282,7 +288,9 @@ async fn run_attach(socket: WebSocket, session: Arc<Session>) -> anyhow::Result<
                 biased;
                 r = rx.recv() => match r {
                     Ok(chunk) => {
-                        if ws_tx.send(Message::Binary(chunk)).await.is_err() {
+                        // One Vec allocation per send (axum 0.7 takes Vec<u8>);
+                        // the broadcast queue itself only holds Arc<[u8]>.
+                        if ws_tx.send(Message::Binary(chunk.to_vec())).await.is_err() {
                             break;
                         }
                     }
@@ -332,15 +340,53 @@ fn rand_id() -> String {
     format!("{n:x}")
 }
 
-fn css(body: &'static str) -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], body)
+fn gz(content_type: &'static str, body: &'static [u8]) -> axum::response::Response {
+    axum::response::Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_ENCODING, "gzip")
+        .header(header::VARY, "Accept-Encoding")
+        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .body(axum::body::Body::from(body))
+        .unwrap()
 }
 
-fn js(body: &'static str) -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
-        body,
-    )
+// Manual accept loop so we can set TCP_NODELAY on every accepted connection.
+// With Nagle enabled, tiny PTY-echo packets can sit in the kernel for up to
+// ~40 ms waiting for delayed-ACKs, which dominates keystroke-echo latency on
+// a remote terminal.
+async fn serve_with_nodelay(listener: tokio::net::TcpListener, app: Router) -> anyhow::Result<()> {
+    use hyper::body::Incoming;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use tower::ServiceExt;
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("accept: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        let io = TokioIo::new(stream);
+        let app = app.clone();
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                let app = app.clone();
+                async move {
+                    app.oneshot(req.map(axum::body::Body::new)).await
+                }
+            });
+            if let Err(e) = Builder::new(TokioExecutor::new())
+                .serve_connection_with_upgrades(io, svc)
+                .await
+            {
+                tracing::debug!("conn: {e}");
+            }
+        });
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -364,15 +410,21 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
-        .route("/assets/xterm.css", get(|| async { css(XTERM_CSS) }))
-        .route("/assets/xterm.js", get(|| async { js(XTERM_JS) }))
+        .route(
+            "/assets/xterm.css",
+            get(|| async { gz("text/css; charset=utf-8", XTERM_CSS_GZ) }),
+        )
+        .route(
+            "/assets/xterm.js",
+            get(|| async { gz("application/javascript; charset=utf-8", XTERM_JS_GZ) }),
+        )
         .route(
             "/assets/xterm-addon-fit.js",
-            get(|| async { js(XTERM_FIT_JS) }),
+            get(|| async { gz("application/javascript; charset=utf-8", XTERM_FIT_JS_GZ) }),
         )
         .route(
             "/assets/xterm-addon-web-links.js",
-            get(|| async { js(XTERM_LINKS_JS) }),
+            get(|| async { gz("application/javascript; charset=utf-8", XTERM_LINKS_JS_GZ) }),
         )
         .route("/ws", get(ws_handler))
         .with_state(state);
@@ -380,6 +432,5 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("serving xterm on http://{addr}");
-    axum::serve(listener, app).await?;
-    Ok(())
+    serve_with_nodelay(listener, app).await
 }
